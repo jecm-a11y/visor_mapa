@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Seguimiento de Ubicación y Geocercas</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; height: 100vh; }
+        .mapboxgl-marker { cursor: pointer; }
+        .marker { box-shadow: 0 0 10px rgba(255,0,0,0.7); }
+        .draw-controls { display:flex; gap:8px; margin-top:8px; }
+    </style>
+
+    <!-- Mapbox -->
+    <script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
+    <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
+
+    <!-- Firebase compat -->
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.1/firebase-database-compat.js"></script>
+</head>
+<body class="font-sans antialiased">
+    <!-- Audio de alerta -->
+    <audio id="alert-sound" preload="auto">
+        <source src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" type="audio/mpeg">
+    </audio>
+    
+    <div id="map"></div>
+
+    <div id="control-panel" class="absolute top-4 left-4 p-4 bg-white bg-opacity-95 shadow-2xl rounded-lg z-10 w-96">
+        <h1 class="text-xl font-bold text-gray-800 mb-2">Seguimiento en Vivo: <span id="user-id-display">Usuario 123</span></h1>
+
+        <div class="mb-3 border-b pb-2">
+            <p class="text-sm text-gray-600 mb-1">Estado: <span id="status" class="font-semibold text-yellow-600">Conectando...</span></p>
+            <p class="text-xs text-gray-500">Última Latitud: <span id="last-lat">N/A</span></p>
+            <p class="text-xs text-gray-500">Última Longitud: <span id="last-lng">N/A</span></p>
+            <p class="text-xs text-gray-500">Hora: <span id="last-time">N/A</span></p>
+            <div id="point-count" class="mt-1 text-sm font-medium text-indigo-600">Total de puntos: 0</div>
+        </div>
+
+        <h2 class="text-md font-semibold text-gray-700 mb-2 mt-2 border-t pt-2">Control de Geocerca</h2>
+        <div id="geofence-status" class="text-sm font-medium text-red-500 mb-2">Estado: Sin Geocerca</div>
+
+        <!-- Dibujo manual -->
+        <div class="mb-3">
+            <p class="text-xs font-semibold text-gray-600 mb-2">Dibuja tu propio polígono:</p>
+            
+            <div class="draw-controls">
+                <button id="draw-polygon" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-2 px-3 rounded-lg text-sm">✏️ Dibujar polígono</button>
+                <button id="finish-draw" class="w-full bg-green-500 hover:bg-green-600 text-white py-2 px-3 rounded-lg text-sm" disabled>✅ Finalizar</button>
+                <button id="cancel-draw" class="w-full bg-red-500 hover:bg-red-600 text-white py-2 px-3 rounded-lg text-sm" disabled>✖ Cancelar</button>
+            </div>
+        </div>
+
+        <button id="save-geofence" class="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg transition duration-150 shadow-md disabled:opacity-50" disabled>Guardar Geocerca en Firebase</button>
+        <button id="delete-geofence" class="w-full mt-2 bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-4 rounded-lg transition duration-150 shadow-md disabled:opacity-50" disabled>Eliminar Geocerca de Firebase</button>
+    </div>
+
+    <script>
+        // --- CONFIG ---
+        mapboxgl.accessToken = 'pk.eyJ1IjoiamhvbmExMjMyIiwiYSI6ImNtZnZnNGh5djA3Y2syaXBvN2lndnpuaWEifQ.rvs2dJwirda1Ta8779MfIg';
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDrOCnHt0T0TYXMx4wE9YIzxzPjHXr1Zck",
+            authDomain: "mapboxjh-default-rtdb.firebaseapp.com",
+            databaseURL: "https://mapboxjh-default-rtdb.firebaseio.com",
+            projectId: "mapboxjh",
+            storageBucket: "mapboxjh.appspot.com",
+            messagingSenderId: "652828038341"
+        };
+
+        const USER_ID = 'user_123';
+        document.getElementById('user-id-display').textContent = USER_ID;
+
+        const LOCATION_PATH = `locations/${USER_ID}`;
+        const GEOFENCE_PATH = `geofence/${USER_ID}`;
+
+        const app = firebase.initializeApp(firebaseConfig);
+        const database = firebase.database();
+        const locationsRef = database.ref(LOCATION_PATH);
+        const geofenceRef = database.ref(GEOFENCE_PATH);
+
+        const DEFAULT_CENTER = [-68.297, -16.645];
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/streets-v12',
+            center: DEFAULT_CENTER,
+            zoom: 14
+        });
+
+        let geojsonSource;
+        let pointsData = [];
+        let markers = [];
+        let currentGeofenceLayer = null;
+        let currentGeofenceFeatureId = null;
+        let isInsideGeofence = null; // null = sin geocerca, true = dentro, false = fuera
+
+        // Función para verificar si un punto está dentro del polígono
+        function isPointInPolygon(point, polygon) {
+            const [lng, lat] = point;
+            const coords = polygon[0]; // Primera ring del polígono
+            
+            let inside = false;
+            for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+                const xi = coords[i][0], yi = coords[i][1];
+                const xj = coords[j][0], yj = coords[j][1];
+                
+                const intersect = ((yi > lat) !== (yj > lat))
+                    && (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+                if (intersect) inside = !inside;
+            }
+            
+            return inside;
+        }
+
+        // --- DIBUJO MANUAL (polígono con clicks) ---
+        let drawingMode = false;
+        let drawCoords = [];      // array de [lng,lat] para el polígono en construcción
+        let drawMarkers = [];     // markers temporales de vértices
+        let drawLineId = 'draw-line-temp';
+
+        function startDrawing() {
+            drawingMode = true;
+            drawCoords = [];
+            clearTempDraw();
+            document.getElementById('finish-draw').disabled = false;
+            document.getElementById('cancel-draw').disabled = false;
+            // visual
+            map.getCanvas().style.cursor = 'crosshair';
+        }
+
+        function finishDrawing() {
+            if (drawCoords.length < 3) {
+                alert('Necesitas al menos 3 puntos para formar un polígono.');
+                return;
+            }
+
+            // cerrar polígono
+            drawCoords.push(drawCoords[0]);
+
+            // eliminar capa/ fuente anterior si existía
+            if (map.getLayer('geofence-fill')) map.removeLayer('geofence-fill');
+            if (map.getLayer('geofence-outline')) map.removeLayer('geofence-outline');
+            if (map.getSource('geofence')) map.removeSource('geofence');
+
+            // crear nueva fuente con los coords dibujados
+            map.addSource('geofence', {
+                type: 'geojson',
+                data: { type: 'Feature', geometry: { type: 'Polygon', coordinates: [drawCoords] } }
+            });
+
+            map.addLayer({
+                id: 'geofence-fill',
+                type: 'fill',
+                source: 'geofence',
+                paint: { 'fill-color': '#FF6600', 'fill-opacity': 0.25 }
+            });
+            map.addLayer({
+                id: 'geofence-outline',
+                type: 'line',
+                source: 'geofence',
+                paint: { 'line-color': '#FF6600', 'line-width': 3 }
+            });
+
+            currentGeofenceLayer = [drawCoords];
+            currentGeofenceFeatureId = 'manual';
+            document.getElementById('save-geofence').disabled = false;
+            document.getElementById('delete-geofence').disabled = false;
+            document.getElementById('finish-draw').disabled = true;
+            document.getElementById('cancel-draw').disabled = true;
+
+            stopDrawing();
+        }
+
+        function cancelDrawing() {
+            clearTempDraw();
+            drawCoords = [];
+            drawingMode = false;
+            document.getElementById('finish-draw').disabled = true;
+            document.getElementById('cancel-draw').disabled = true;
+            map.getCanvas().style.cursor = '';
+        }
+
+        function stopDrawing() {
+            drawingMode = false;
+            drawMarkers.forEach(m => m.remove());
+            drawMarkers = [];
+            // eliminar linea temporal si existe
+            if (map.getLayer(drawLineId)) map.removeLayer(drawLineId);
+            if (map.getSource('draw-line')) map.removeSource('draw-line');
+            map.getCanvas().style.cursor = '';
+        }
+
+        function clearTempDraw() {
+            drawMarkers.forEach(m => m.remove());
+            drawMarkers = [];
+            if (map.getLayer(drawLineId)) map.removeLayer(drawLineId);
+            if (map.getSource('draw-line')) map.removeSource('draw-line');
+        }
+
+        // al hacer click en modo dibujo, agregamos vértices
+        map.on('click', (e) => {
+            if (drawingMode) {
+                const lngLat = [e.lngLat.lng, e.lngLat.lat];
+                drawCoords.push(lngLat);
+
+                // marcador temporal
+                const el = document.createElement('div');
+                el.className = 'bg-blue-600 w-4 h-4 rounded-full border-2 border-white';
+                const m = new mapboxgl.Marker(el).setLngLat(lngLat).addTo(map);
+                drawMarkers.push(m);
+
+                // actualizar línea temporal (polyline)
+                // limpiar fuente previa
+                if (map.getLayer(drawLineId)) map.removeLayer(drawLineId);
+                if (map.getSource('draw-line')) map.removeSource('draw-line');
+
+                // crear source/line con drawCoords
+                map.addSource('draw-line', {
+                    type: 'geojson',
+                    data: {
+                        type: 'Feature',
+                        geometry: { type: 'LineString', coordinates: drawCoords }
+                    }
+                });
+                map.addLayer({
+                    id: drawLineId,
+                    type: 'line',
+                    source: 'draw-line',
+                    paint: { 'line-color': '#2563EB', 'line-width': 2, 'line-dasharray': [2,2] }
+                });
+            }
+        });
+
+        // --- BOTONES DIBUJO MANUAL ---
+        document.getElementById('draw-polygon').addEventListener('click', () => {
+            startDrawing();
+            document.getElementById('geofence-status').textContent = 'Modo: Dibujando polígono (clicks)';
+            document.getElementById('geofence-status').classList.remove('text-red-500');
+            document.getElementById('geofence-status').classList.add('text-yellow-600');
+        });
+
+        document.getElementById('finish-draw').addEventListener('click', () => {
+            finishDrawing();
+            document.getElementById('geofence-status').textContent = 'Estado: Geocerca dibujada (manual)';
+            document.getElementById('geofence-status').classList.remove('text-yellow-600');
+            document.getElementById('geofence-status').classList.add('text-green-600');
+        });
+
+        document.getElementById('cancel-draw').addEventListener('click', () => {
+            cancelDrawing();
+            document.getElementById('geofence-status').textContent = 'Estado: Dibujo cancelado';
+            document.getElementById('geofence-status').classList.remove('text-yellow-600');
+            document.getElementById('geofence-status').classList.add('text-red-500');
+        });
+
+        // --- FIREBASE: escuchar geocerca guardada por otros clientes ---
+        function setupGeofenceListener() {
+            geofenceRef.on('value', (snapshot) => {
+                const coordinates = snapshot.val();
+
+                // limpiar dibujo previo
+                if (currentGeofenceLayer) {
+                    if (map.getLayer('geofence-fill')) map.removeLayer('geofence-fill');
+                    if (map.getLayer('geofence-outline')) map.removeLayer('geofence-outline');
+                    if (map.getSource('geofence')) map.removeSource('geofence');
+                    currentGeofenceLayer = null;
+                }
+
+                if (coordinates) {
+                    document.getElementById('geofence-status').textContent = 'Estado: Geocerca activa (Firebase)';
+                    document.getElementById('geofence-status').classList.remove('text-red-500');
+                    document.getElementById('geofence-status').classList.add('text-green-600');
+
+                    map.addSource('geofence', {
+                        type: 'geojson',
+                        data: {
+                            type: 'Feature',
+                            geometry: {
+                                type: 'Polygon',
+                                coordinates: coordinates
+                            }
+                        }
+                    });
+
+                    map.addLayer({
+                        id: 'geofence-fill',
+                        type: 'fill',
+                        source: 'geofence',
+                        paint: { 'fill-color': '#FF6600', 'fill-opacity': 0.2 }
+                    });
+
+                    map.addLayer({
+                        id: 'geofence-outline',
+                        type: 'line',
+                        source: 'geofence',
+                        paint: { 'line-color': '#FF6600', 'line-width': 3 }
+                    });
+
+                    currentGeofenceLayer = coordinates;
+                    currentGeofenceFeatureId = 'firebase';
+                    document.getElementById('delete-geofence').disabled = false;
+                } else {
+                    document.getElementById('geofence-status').textContent = 'Estado: Sin Geocerca';
+                    document.getElementById('geofence-status').classList.add('text-red-500');
+                    document.getElementById('geofence-status').classList.remove('text-green-600');
+                    currentGeofenceFeatureId = null;
+                    document.getElementById('delete-geofence').disabled = true;
+                    document.getElementById('save-geofence').disabled = true;
+                }
+            });
+        }
+
+        // --- GUARDAR / ELIMINAR EN FIREBASE ---
+        document.getElementById('save-geofence').addEventListener('click', () => {
+            if (currentGeofenceLayer) {
+                geofenceRef.set(currentGeofenceLayer)
+                    .then(() => {
+                        alert("Geocerca guardada exitosamente en Firebase.");
+                    })
+                    .catch(error => {
+                        console.error("Error al guardar la geocerca:", error);
+                        alert("Error al guardar la Geocerca: " + error.message);
+                    });
+            }
+        });
+
+        document.getElementById('delete-geofence').addEventListener('click', () => {
+            geofenceRef.remove()
+                .then(() => {
+                    alert("Geocerca eliminada de Firebase.");
+                })
+                .catch(error => {
+                    console.error("Error al eliminar la geocerca:", error);
+                    alert("Error al eliminar la Geocerca: " + error.message);
+                });
+        });
+
+        // --- RASTREO / MAP UPDATE (ligero, mantiene tu lógica) ---
+        map.on('load', () => {
+            document.getElementById('status').textContent = 'Conectado. Esperando datos...';
+
+            map.addSource('route', {
+                type: 'geojson',
+                data: { type: 'FeatureCollection', features: [] }
+            });
+
+            map.addLayer({
+                id: 'route-line',
+                type: 'line',
+                source: 'route',
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                paint: { 'line-color': '#4F46E5', 'line-width': 4 }
+            });
+
+            map.addLayer({
+                id: 'route-points',
+                type: 'circle',
+                source: 'route',
+                paint: {
+                    'circle-radius': 4,
+                    'circle-color': '#10B981',
+                    'circle-stroke-color': '#fff',
+                    'circle-stroke-width': 1
+                },
+                filter: ['!=', '$type', 'LineString']
+            });
+
+            geojsonSource = map.getSource('route');
+
+            setupFirebaseListener();
+            setupGeofenceListener();
+        });
+
+        function setupFirebaseListener() {
+            locationsRef.on('value', (snapshot) => {
+                pointsData = [];
+                let lastPoint = null;
+
+                snapshot.forEach((childSnapshot) => {
+                    const data = childSnapshot.val();
+                    if (data && typeof data.latitude === 'number' && typeof data.longitude === 'number') {
+                        const lngLat = [data.longitude, data.latitude];
+                        pointsData.push(lngLat);
+                        lastPoint = { lngLat: lngLat, time: data.time || 'Hora no registrada' };
+                    }
+                });
+
+                document.getElementById('point-count').textContent = `Total de puntos: ${pointsData.length}`;
+
+                if (pointsData.length > 0) {
+                    document.getElementById('status').textContent = 'Rastreo en curso';
+                    updateMap(pointsData, lastPoint);
+                } else {
+                    document.getElementById('status').textContent = 'Esperando la primera ubicación...';
+                }
+            }, (errorObject) => {
+                document.getElementById('status').textContent = `ERROR: ${errorObject.code}. Revisa las reglas de seguridad.`;
+                console.error('Firebase error:', errorObject.code);
+            });
+        }
+
+        function updateMap(history, lastPoint) {
+            const geojsonFeatures = [{
+                type: 'Feature',
+                properties: {},
+                geometry: { type: 'LineString', coordinates: history }
+            }];
+
+            history.forEach(coord => {
+                geojsonFeatures.push({
+                    type: 'Feature',
+                    properties: { name: 'point' },
+                    geometry: { type: 'Point', coordinates: coord }
+                });
+            });
+
+            if (geojsonSource && geojsonSource.setData) {
+                geojsonSource.setData({ type: 'FeatureCollection', features: geojsonFeatures });
+            }
+
+            if (lastPoint) {
+                const [lng, lat] = lastPoint.lngLat;
+
+                // Verificar si hay geocerca activa y si el punto está dentro
+                if (currentGeofenceLayer) {
+                    const pointInside = isPointInPolygon([lng, lat], currentGeofenceLayer);
+                    
+                    // Detectar cambio de estado (de dentro a fuera)
+                    if (isInsideGeofence !== null && isInsideGeofence === true && pointInside === false) {
+                        // Usuario acaba de SALIR de la geocerca
+                        // Reproducir sonido
+                        const alertSound = document.getElementById('alert-sound');
+                        alertSound.play();
+                        
+                        // Mostrar alerta
+                        alert('⚠️ ALERTA: El usuario ha salido de la geocerca!');
+                    }
+                    
+                    isInsideGeofence = pointInside;
+                } else {
+                    isInsideGeofence = null;
+                }
+
+                markers.forEach(marker => marker.remove());
+                markers = [];
+
+                const el = document.createElement('div');
+                el.className = 'marker bg-red-600 w-5 h-5 rounded-full border-2 border-white transform scale-150 animate-pulse ring-4 ring-red-400/50';
+
+                const marker = new mapboxgl.Marker(el)
+                    .setLngLat(lastPoint.lngLat)
+                    .setPopup(new mapboxgl.Popup().setHTML(`
+                        <h3 class="font-bold text-red-600">Ubicación Actual</h3>
+                        <p>Lat: ${lat.toFixed(6)}</p>
+                        <p>Lng: ${lng.toFixed(6)}</p>
+                        <p class="text-xs text-gray-500">Hora: ${lastPoint.time}</p>
+                    `))
+                    .addTo(map);
+
+                markers.push(marker);
+
+                map.flyTo({ center: lastPoint.lngLat, speed: 0.8, zoom: 16 });
+
+                document.getElementById('last-lat').textContent = lat.toFixed(6);
+                document.getElementById('last-lng').textContent = lng.toFixed(6);
+                document.getElementById('last-time').textContent = lastPoint.time;
+            }
+        }
+    </script>
+</body>
+</html>
